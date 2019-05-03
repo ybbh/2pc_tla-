@@ -59,9 +59,10 @@ TPTypeOK ==
   (*************************************************************************)
   (* The type-correctness invariant                                        *)
   (*************************************************************************)
-  /\ rmState \in [RM -> {"working", "prepared", "committed", "aborted", "ended"}]
+  /\ rmState \in [RM -> {"working", "prepared", "committed", "to abort", "aborted", "ended"}]
   /\ tmPrepared \in [RM -> SUBSET RM]
   /\ tmACK \in [RM -> SUBSET RM]
+  \*/\ rmStatus \in [RM -> {"right", "error"}]
   \*/\ msgs \subseteq Message
 
 TPInit ==   
@@ -72,6 +73,7 @@ TPInit ==
   /\ tmPrepared   = [rm \in RM |-> {}]
   /\ tmACK = [rm \in RM |-> {}]
   /\ msgs = {}
+  \*/\ rmStatus = [rm \in RM |-> "right"]
 -----------------------------------------------------------------------------
 (***************************************************************************)
 (* We now define the actions that may be performed by the processes, first *)
@@ -87,6 +89,14 @@ TMRcvPrepared(rm, tm) ==
   /\ tmPrepared' = [tmPrepared EXCEPT ![tm] = @ \cup {rm}]
   /\ UNCHANGED <<rmState, tmACK>>
 
+TMRecovery(tm) == 
+  (*************************************************************************)
+  (* Transaction manager $tm$ crush recovery.                                       *)
+  (*************************************************************************)
+  /\ tmPrepared' = [tmPrepared EXCEPT ![tm] = {}]
+  /\ tmACK' = [tmACK EXCEPT ![tm] = {}]
+  /\ UNCHANGED <<rmState, msgs>>
+  
 TMRcvNo(rm, tm) ==
   (*************************************************************************)
   (* The TM receives a $"No"$ message from resource manager $rm$.    *)
@@ -109,6 +119,15 @@ TMCommit(tm) ==
         msgs' = msgs \cup msg \*TODO
   /\ UNCHANGED <<rmState, tmPrepared, tmACK>>
 
+TMPrepare(tm) ==
+  (*************************************************************************)
+  (* The TM prepare the transaction; enabled iff the TM is in its initial  *)
+  (* state and every RM has sent a $"Prepared"$ message.                   *)
+  (*************************************************************************)
+  /\ LET msg == [type : {"Prepare"}, rm : RM, tm : {tm}] IN
+        msgs' = msgs \cup msg
+  /\ UNCHANGED <<rmState, tmPrepared, tmACK>>
+  
 TMRcvACK(rm, tm) ==
   (*************************************************************************)
   (* The TM receives a $"ACK"$ message from resource manager $rm$.    *)
@@ -132,23 +151,40 @@ TMAbort(tm) ==
   (*************************************************************************)
   (* The TM spontaneously aborts the transaction.                          *)
   (*************************************************************************)
-  /\ rmState[tm] = "working"
-  /\ rmState' = [rmState EXCEPT ![tm] = "working"]
+  /\ rmState[tm] = "to abort"
+  /\ rmState' = [rmState EXCEPT ![tm] = "aborted"]
   /\ LET msg == [type : {"Abort"}, rm : RM, tm : {tm}] IN
         msgs' = msgs \cup msg \*TODO
-  /\ UNCHANGED <<rmState, tmPrepared, tmACK>>
+  /\ UNCHANGED <<tmPrepared, tmACK>>
 
-RMPrepare(rm, tm) == 
+RMRecovery(rm) ==
+  (*************************************************************************)
+  (* Resource manager $rm$ crush recovery.                                       *)
+  (*************************************************************************)
+  /\ CASE rmState[rm] = "prepared"
+     -> /\ msgs' = msgs  \cup [type : {"Prepare"}, rm : RM, tm : {rm}]
+        /\ UNCHANGED <<rmState>>
+     [] rmState[rm] = "committed"
+     -> /\ msgs' = msgs  \cup [type : {"Commit"}, rm : RM, tm : {rm}]
+        /\ UNCHANGED <<rmState>>
+     [] OTHER 
+     -> /\ rmState' =  [rmState EXCEPT ![rm] = "aborted"]
+        /\ UNCHANGED <<msgs>>
+  /\ UNCHANGED <<tmPrepared, tmACK>>
+  
+RMRcvPrepare(rm, tm) == 
   (*************************************************************************)
   (* Resource manager $rm$ prepares.                                       *)
   (*************************************************************************)
+  LET msg == [type |-> "Prepare", rm |-> rm , tm |-> tm] IN
+  /\ msg \in msgs
   /\ IF rmState[rm] = "working" THEN
         rmState' = [rmState EXCEPT ![rm] = "prepared"]
      ELSE UNCHANGED rmState
-  /\ IF rmState[rm] = "aborted" THEN
-        msgs' = msgs \cup {[type |-> "No", rm |-> rm, tm |-> tm]}
+  /\ IF rmState[rm] = "aborted" \/ rmState[rm] = "to abort" THEN
+        msgs' = (msgs \ {msg}) \cup {[type |-> "No", rm |-> rm, tm |-> tm]}
      ELSE
-        msgs' = msgs \cup {[type |-> "Prepared", rm |-> rm, tm |-> tm]}
+        msgs' = (msgs \ {msg}) \cup {[type |-> "Prepared", rm |-> rm, tm |-> tm]}
   /\ UNCHANGED <<tmPrepared, tmACK>>
   
 RMChooseToAbort(rm) ==
@@ -157,7 +193,7 @@ RMChooseToAbort(rm) ==
   (* above, $rm$ does not send any message in our simplified spec.         *)
   (*************************************************************************)
   /\ rmState[rm] = "working"
-  /\ rmState' = [rmState EXCEPT ![rm] = "aborted"]
+  /\ rmState' = [rmState EXCEPT ![rm] = "to abort"]
   /\ UNCHANGED <<tmPrepared, tmACK, msgs>>
 
 RMRcvCommitMsg(rm, tm) ==
@@ -194,12 +230,15 @@ RMRcvEndMsg(rm, tm) ==
 
 TPNext ==
   \E tm \in RM:
-      \/ TMCommit(tm) 
+      \/ TMCommit(tm)
+      \/ TMPrepare(tm)
       \/ TMAbort(tm)
+      \/ TMRecovery(tm)
+      \/ RMRecovery(tm)
       \/ \E rm \in RM: 
            \/ TMRcvPrepared(rm, tm) 
            \/ TMRcvNo(rm, tm)
-           \/ RMPrepare(rm, tm) 
+           \/ RMRcvPrepare(rm, tm) 
            \/ RMChooseToAbort(rm)
            \/ RMRcvCommitMsg(rm, tm) 
            \/ RMRcvAbortMsg(rm, tm)
@@ -215,9 +254,21 @@ TCConsistent ==
   \A rm1, rm2 \in RM : ~ /\ rmState[rm1] = "aborted"
                          /\ (\/ rmState[rm2] = "committed"
                              \/ rmState[rm2] = "ended")
-                         
+                             
+(***************************************************************************)
+(* The complete state of NPS2PC will be $ended$.                           *)
+(***************************************************************************)
+TCEnd ==
+    \/ \A rm \in RM : /\ rmState[rm] = "aborted"
+    \/ \A rm \in RM : /\ rmState[rm] = "ended"
 -----------------------------------------------------------------------------
-TPSpec == TPInit /\ [][TPNext]_<<rmState, tmPrepared, msgs>>
+TPSpec == /\ TPInit 
+          /\ [][TPNext]_<<rmState, tmPrepared, tmACK, msgs>>
+          /\ \A rm \in RM: 
+                WF_<<rmState, tmPrepared, tmACK, msgs>>(
+                      \/ RMRecovery(rm)
+                      \/ TMRecovery(rm))
+                      
   (*************************************************************************)
   (* The complete spec of the Two-Phase Commit protocol.                   *)
   (*************************************************************************)
@@ -230,7 +281,9 @@ THEOREM TPSpec => []TPTypeOK
 -----------------------------------------------------------------------------
 
 
-THEOREM TPSpec => TCConsistent
+THEOREM TPSpec =>  TCConsistent
+
+THEOREM TPSpec =>  <> TCEnd
   (*************************************************************************)
   (* This theorem asserts that the specification TPSpec of the Two-Phase   *)
   (* Commit protocol implements the specification TCSpec of the            *)
@@ -244,5 +297,7 @@ THEOREM TPSpec => TCConsistent
 
 =============================================================================
 \* Modification History
+\* Last modified Fri May 03 22:01:46 CST 2019 by ybbh
+\* Last modified Fri May 03 19:56:34 CST 2019 by ybbh
 \* Last modified Mon Apr 22 20:51:41 CST 2019 by ybbh
 \* Created Mon Mar 18 15:48:50 CST 2019 by ybbh
